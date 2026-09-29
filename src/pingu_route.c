@@ -27,7 +27,7 @@ static void pingu_route_add_sorted(struct list_head *route_list,
 static struct pingu_route *pingu_route_clone(struct pingu_route *gw)
 {
 	struct pingu_route *new_gw = calloc(1, sizeof(struct pingu_route));
-	if (gw == NULL) {
+	if (new_gw == NULL) {
 		log_perror("Failed to allocate gateway");
 		return NULL;
 	}
@@ -81,6 +81,11 @@ static int gateway_cmp(struct pingu_route *a, struct pingu_route *b)
 	r = sockaddr_cmp(&a->gw_addr, &b->gw_addr);
 	if (r != 0)
 		return r;
+	if (a->src_len != b->src_len)
+		return a->src_len - b->src_len;
+	r = sockaddr_cmp(&a->src, &b->src);
+	if (r != 0)
+		return r;
 	return a->metric - b->metric;
 }
 
@@ -110,6 +115,8 @@ void pingu_route_add(struct list_head *route_list,
 	struct pingu_route *new_gw = pingu_route_clone(gw);
 	if (new_gw == NULL)
 		return;
+	/* Address/route dumps and subsequent notifications may overlap. */
+	pingu_route_del(route_list, gw);
 	pingu_route_add_sorted(route_list, new_gw);
 }
 
@@ -126,22 +133,23 @@ void pingu_route_del(struct list_head *route_list,
 
 int is_default_gw(struct pingu_route *route)
 {
+	if (route->dst_len != 0 || route->src_len != 0)
+		return 0;
 	switch (route->dest.sa.sa_family) {
 	case AF_INET:
 		return (route->dest.sin.sin_addr.s_addr == 0);
 		break;
 	case AF_INET6:
-		log_debug("TODO: ipv6");
-		break;
+		return IN6_IS_ADDR_UNSPECIFIED(&route->dest.sin6.sin6_addr);
 	}
 	return 0;
 }
 		
-struct pingu_route *pingu_route_first_default(struct list_head *route_list)
+struct pingu_route *pingu_route_first_default(struct list_head *route_list, int family)
 {
 	struct pingu_route *entry;
 	list_for_each_entry(entry, route_list, route_list_entry) {
-		if (is_default_gw(entry))
+		if (entry->dest.sa.sa_family == family && is_default_gw(entry))
 			return entry;
 	}
 	return NULL;

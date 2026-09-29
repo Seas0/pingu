@@ -10,6 +10,23 @@
 
 #define PINGU_ROUTE_TABLE_AUTO -1
 
+struct pingu_iface_addr {
+	union sockaddr_any addr;
+	struct list_head entry;
+};
+
+struct pingu_iface_family {
+	struct pingu_iface *iface;
+	int family;
+	int fd;
+	int has_binding;
+	int has_route_rule;
+	int has_multipath;
+	union sockaddr_any primary_addr;
+	struct list_head addresses;
+	struct ev_io socket_watcher;
+};
+
 struct pingu_iface {
 	char name[32];
 	char *label;
@@ -20,33 +37,29 @@ struct pingu_iface {
 
 	int index;
 	int has_link;
-	int has_address;
-	int has_binding;
-	int has_route_rule;
-	int has_multipath;
 	int balance;
 	int balance_weight;
-	int fd;
-	union sockaddr_any primary_addr;
+	struct pingu_iface_family ipv4;
+	struct pingu_iface_family ipv6;
 	int route_table;
 	int rule_priority;
 	int fwmark;
 	struct list_head iface_list_entry;
 	struct list_head ping_list;
 	struct list_head route_list;
-	struct ev_io socket_watcher;
 };
 
 struct pingu_iface *pingu_iface_get_by_name(const char *name);
 struct pingu_iface *pingu_iface_get_by_index(int index);
 struct pingu_iface *pingu_iface_get_by_name_or_new(const char *name);
-int pingu_iface_bind_socket(struct pingu_iface *iface, int log_error);
-int pingu_iface_usable(struct pingu_iface *iface);
+struct pingu_iface_family *pingu_iface_family(struct pingu_iface *iface, int family);
+int pingu_iface_bind_socket(struct pingu_iface *iface, int family, int log_error);
+int pingu_iface_usable(struct pingu_iface *iface, int family);
 int pingu_iface_init(struct ev_loop *loop);
 
 void pingu_iface_set_balance(struct pingu_iface *iface, int balance_weight);
-void pingu_iface_set_addr(struct pingu_iface *iface, int family,
-			  void *data, int len);
+int pingu_iface_update_addr(struct pingu_iface *iface, int family,
+			    void *data, int len, int add);
 void pingu_iface_adjust_hosts_online(struct pingu_iface *iface, int adjustment);
 int pingu_iface_set_route_table(struct pingu_iface *iface, int table);
 

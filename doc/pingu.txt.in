@@ -23,6 +23,13 @@ the primary IP address of the corresponding interface. This guarantees
 that a service bound to the primary address of an interface will always
 use routes from that interface.
 
+IPv4 and IPv6 are supported simultaneously. Each family has its own primary
+address and source rule (a /32 for IPv4, a /128 for IPv6). IPv6 prefers a
+stable global address to a link-local address and ignores tentative and
+temporary addresses. Address deletion selects another available address
+without changing the other family's state. Load-balancing routes contain
+nexthops of a single address family.
+
 It can also ping specified hosts at regular intervals to detect if a
 gateway via a certain interface goes down. It will then remove the default
 gateway(s) via this interface from main route table so that traffic not
@@ -69,5 +76,4 @@ FILES
 AUTHORS
 -------
 Natanael Copa
-
 

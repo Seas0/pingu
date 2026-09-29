@@ -77,8 +77,8 @@ struct netlink_fd {
 static const int netlink_groups[] = {
 	0,
 	RTMGRP_LINK,
-	RTMGRP_IPV4_IFADDR,
-	RTMGRP_IPV4_ROUTE,
+	RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
+	RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE,
 };
 static struct netlink_fd netlink_fds[ARRAY_SIZE(netlink_groups)];
 #define talk_fd netlink_fds[0]
@@ -175,7 +175,7 @@ static int netlink_log_error(struct nlmsghdr *hdr)
 	return err;
 }
 
-static int netlink_receive(struct netlink_fd *fd, struct nlmsghdr *reply)
+static int netlink_receive(struct netlink_fd *fd, struct nlmsghdr *reply, int dump)
 {
 	struct sockaddr_nl nladdr;
 	struct iovec iov;
@@ -194,7 +194,7 @@ static int netlink_receive(struct netlink_fd *fd, struct nlmsghdr *reply)
 		struct nlmsghdr *h;
 
 		iov.iov_len = sizeof(buf);
-		status = recvmsg(fd->fd, &msg, MSG_DONTWAIT);
+		status = recvmsg(fd->fd, &msg, reply || dump ? 0 : MSG_DONTWAIT);
 		if (status < 0) {
 			if (errno == EINTR)
 				continue;
@@ -220,11 +220,13 @@ static int netlink_receive(struct netlink_fd *fd, struct nlmsghdr *reply)
 				}
 				memcpy(reply, h, len);
 				got_reply = TRUE;
-			} else if (h->nlmsg_type <= fd->dispatch_size &&
+			} else if (h->nlmsg_type < fd->dispatch_size &&
 				fd->dispatch[h->nlmsg_type] != NULL) {
 				fd->dispatch[h->nlmsg_type](h);
 			} else if (h->nlmsg_type == NLMSG_ERROR) {
-				return netlink_log_error(h);
+				return netlink_log_error(h) == 0;
+			} else if (h->nlmsg_type == NLMSG_DONE && dump) {
+				return TRUE;
 			} else if (h->nlmsg_type != NLMSG_DONE) {
 				log_info("Unknown NLmsg: 0x%08x, len %d",
 					  h->nlmsg_type, h->nlmsg_len);
@@ -277,7 +279,7 @@ static int netlink_talk(struct netlink_fd *fd, struct nlmsghdr *req,
 		return TRUE;
 
 	reply->nlmsg_len = replysize;
-	return netlink_receive(fd, reply);
+	return netlink_receive(fd, reply, FALSE);
 }
 
 static int netlink_enumerate(struct netlink_fd *fd, int family, int type)
@@ -299,8 +301,10 @@ static int netlink_enumerate(struct netlink_fd *fd, int family, int type)
 	req.nlh.nlmsg_seq = ++fd->seq;
 	req.g.rtgen_family = family;
 
-	return sendto(fd->fd, (void *) &req, sizeof(req), 0,
-		      (struct sockaddr *) &addr, sizeof(addr)) >= 0;
+	if (sendto(fd->fd, &req, sizeof(req), 0,
+		   (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		return FALSE;
+	return netlink_receive(fd, NULL, TRUE);
 }
 
 int netlink_route_modify(struct netlink_fd *fd, int action_type,
@@ -324,12 +328,15 @@ int netlink_route_modify(struct netlink_fd *fd, int action_type,
 	req.msg.rtm_family = route->dest.sa.sa_family;
 	req.msg.rtm_table = table;
 	req.msg.rtm_dst_len = route->dst_len;
+	req.msg.rtm_src_len = route->src_len;
 	req.msg.rtm_protocol = route->protocol;
 	req.msg.rtm_scope = route->scope;
 	req.msg.rtm_type = route->type;
 
 	netlink_add_rtattr_addr_any(&req.nlh, sizeof(req), RTA_DST,
 					&route->dest);
+	if (route->src_len)
+		netlink_add_rtattr_addr_any(&req.nlh, sizeof(req), RTA_SRC, &route->src);
 	netlink_add_rtattr_addr_any(&req.nlh, sizeof(req), RTA_GATEWAY,
 					&route->gw_addr);
 	netlink_add_rtattr_l(&req.nlh, sizeof(req), RTA_OIF, &route->dev_index, 4);
@@ -338,7 +345,7 @@ int netlink_route_modify(struct netlink_fd *fd, int action_type,
 				     &route->metric, 4);
 
 	if (!netlink_talk(fd, &req.nlh, sizeof(req), &req.nlh))
-		return FALSE;
+		return -1;
 	return netlink_get_error(&req.nlh);
 }
 
@@ -347,7 +354,7 @@ static int add_one_nh(struct rtattr *rta, struct rtnexthop *rtnh,
 		      struct pingu_route *route)
 {
 	int addr_size;
-	char addrbuf[40] = "";
+	char addrbuf[80] = "";
 	if (route == NULL)
 		return 0;
 	addr_size = netlink_add_subrtattr_addr_any(rta, 1024, RTA_GATEWAY,
@@ -365,7 +372,7 @@ static int add_one_nh(struct rtattr *rta, struct rtnexthop *rtnh,
 }
 
 static int add_nexthops(struct nlmsghdr *nlh, size_t nlh_size,
-			 struct list_head *iface_list, int action_type)
+			 struct list_head *iface_list, int action_type, int family)
 {
 	char buf[1024];
 	struct rtattr *rta = (void *)buf;
@@ -380,23 +387,26 @@ static int add_nexthops(struct nlmsghdr *nlh, size_t nlh_size,
 	rtnh = RTA_DATA(rta);
 
 	list_for_each_entry(iface, iface_list, iface_list_entry) {
-		route = pingu_route_first_default(&iface->route_list);
+		struct pingu_iface_family *state = pingu_iface_family(iface, family);
+		route = pingu_route_first_default(&iface->route_list, family);
 		switch (action_type) {
 		case RTM_NEWROUTE:
 			if ((!iface->balance) || iface->index == 0
 			    || !pingu_iface_gw_is_online(iface)
 			    || route == NULL) {
-				iface->has_multipath = 0;
+				state->has_multipath = 0;
 				continue;
 			}
-			iface->has_multipath = 1;
+			state->has_multipath = 1;
 			break;
 		case RTM_DELROUTE:
-			if (!iface->has_multipath)
+			if (!state->has_multipath)
 				continue;
-			iface->has_multipath = 0;
+			state->has_multipath = 0;
 			break;
 		}
+		if (RTA_ALIGN(rta->rta_len) + sizeof(*rtnh) + RTA_SPACE(16) > sizeof(buf))
+			return -1;
 		memset(rtnh, 0, sizeof(*rtnh));
 		rtnh->rtnh_len = sizeof(*rtnh);
 		rta->rta_len += rtnh->rtnh_len;
@@ -410,7 +420,7 @@ static int add_nexthops(struct nlmsghdr *nlh, size_t nlh_size,
 }
 
 int netlink_route_multipath(struct netlink_fd *fd, int action_type,
-			    struct list_head *iface_list, int table)
+			    struct list_head *iface_list, int table, int family)
 {
 	struct {
 		struct nlmsghdr	nlh;
@@ -418,11 +428,15 @@ int netlink_route_multipath(struct netlink_fd *fd, int action_type,
 		char buf[1024];
 	} req;
 	union sockaddr_any dest;
-	int count = 0;
+	int count = 0, had_multipath = 0;
+	int metric = family == AF_INET6 ? 1 : 0;
+	struct pingu_iface *iface;
 
+	list_for_each_entry(iface, iface_list, iface_list_entry)
+		had_multipath |= pingu_iface_family(iface, family)->has_multipath;
 	memset(&req, 0, sizeof(req));
 	memset(&dest, 0, sizeof(dest));
-	dest.sa.sa_family = AF_INET;
+	dest.sa.sa_family = family;
 
 	req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
 	req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
@@ -430,7 +444,7 @@ int netlink_route_multipath(struct netlink_fd *fd, int action_type,
 	if (action_type == RTM_NEWROUTE)
 		req.nlh.nlmsg_flags |= NLM_F_CREATE | NLM_F_REPLACE;
 
-	req.msg.rtm_family = AF_INET;
+	req.msg.rtm_family = family;
 	req.msg.rtm_table = table;
 	req.msg.rtm_dst_len = 0;
 	req.msg.rtm_protocol = RTPROT_BOOT;
@@ -440,9 +454,17 @@ int netlink_route_multipath(struct netlink_fd *fd, int action_type,
 	netlink_add_rtattr_addr_any(&req.nlh, sizeof(req), RTA_DST,
 					&dest);
 
-	count = add_nexthops(&req.nlh, sizeof(req), iface_list, action_type);
-	if (count == 0)
+	count = add_nexthops(&req.nlh, sizeof(req), iface_list, action_type, family);
+	if (count < 0)
+		return -1;
+	if (count == 0 || action_type == RTM_DELROUTE) {
+		if (!had_multipath)
+			return 0;
 		req.nlh.nlmsg_type = RTM_DELROUTE;
+		/* Identify our route by family and metric, not stale nexthops. */
+		req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	}
+	netlink_add_rtattr_l(&req.nlh, sizeof(req), RTA_PRIORITY, &metric, sizeof(metric));
 
 	if (!netlink_talk(fd, &req.nlh, sizeof(req), &req.nlh))
 		return -1;
@@ -470,13 +492,13 @@ static void netlink_route_flush(struct netlink_fd *fd, struct pingu_iface *iface
 	list_for_each_entry(gw, &iface->route_list, route_list_entry) {
 		err = netlink_route_delete(fd, gw, iface->route_table);
 		if (err > 0)
-			log_error("%s: Failed to clean up route in table %i: ",
+			log_error("%s: Failed to clean up route in table %i: %s",
 				  iface->name, iface->route_table, strerror(err));
 	}
 }
 
 int netlink_rule_modify(struct netlink_fd *fd,
-	struct pingu_iface *iface, int rtm_type, int rule_type)
+	struct pingu_iface *iface, union sockaddr_any *source, int rtm_type, int rule_type)
 {
 	struct {
 		struct nlmsghdr	nlh;
@@ -492,7 +514,7 @@ int netlink_rule_modify(struct netlink_fd *fd,
 	if (rtm_type == RTM_NEWRULE)
 		req.nlh.nlmsg_flags |= NLM_F_CREATE | NLM_F_REPLACE;
 
-	req.msg.rtm_family = AF_INET;
+	req.msg.rtm_family = source->sa.sa_family;
 	req.msg.rtm_table = iface->route_table;
 	req.msg.rtm_protocol = RTPROT_BOOT;
 	req.msg.rtm_scope = RT_SCOPE_UNIVERSE;
@@ -500,9 +522,9 @@ int netlink_rule_modify(struct netlink_fd *fd,
 
 	switch (rule_type) {
 	case FRA_SRC:
-		req.msg.rtm_src_len = 32;
+		req.msg.rtm_src_len = source->sa.sa_family == AF_INET6 ? 128 : 32;
 		netlink_add_rtattr_addr_any(&req.nlh, sizeof(req), FRA_SRC,
-					    &iface->primary_addr);
+					    source);
 		break;
 	case FRA_FWMARK:
 		netlink_add_rtattr_l(&req.nlh, sizeof(req), FRA_FWMARK,
@@ -523,19 +545,21 @@ int netlink_rule_modify(struct netlink_fd *fd,
 	return netlink_get_error(&req.nlh);
 }
 
-int netlink_rule_del(struct netlink_fd *fd,	struct pingu_iface *iface)
+int netlink_rule_del(struct netlink_fd *fd, struct pingu_iface *iface,
+		     union sockaddr_any *source)
 {
 	if (iface->fwmark)
-		netlink_rule_modify(fd, iface, RTM_DELRULE, FRA_FWMARK);
-	return netlink_rule_modify(fd, iface, RTM_DELRULE, FRA_SRC);
+		netlink_rule_modify(fd, iface, source, RTM_DELRULE, FRA_FWMARK);
+	return netlink_rule_modify(fd, iface, source, RTM_DELRULE, FRA_SRC);
 }
 
-int netlink_rule_replace_or_add(struct netlink_fd *fd, struct pingu_iface *iface)
+int netlink_rule_replace_or_add(struct netlink_fd *fd, struct pingu_iface *iface,
+				union sockaddr_any *source)
 {
-	netlink_rule_del(fd, iface);
+	netlink_rule_del(fd, iface, source);
 	if (iface->fwmark)
-		netlink_rule_modify(fd, iface, RTM_NEWRULE, FRA_FWMARK);
-	return netlink_rule_modify(fd, iface, RTM_NEWRULE, FRA_SRC);
+		netlink_rule_modify(fd, iface, source, RTM_NEWRULE, FRA_FWMARK);
+	return netlink_rule_modify(fd, iface, source, RTM_NEWRULE, FRA_SRC);
 }
 
 static void netlink_link_new_cb(struct nlmsghdr *msg)
@@ -558,18 +582,20 @@ static void netlink_link_new_cb(struct nlmsghdr *msg)
 		log_info("New interface: %s", ifname);
 
 	iface->index = ifi->ifi_index;
-	if (ifi->ifi_flags & IFF_LOWER_UP) {
+	if ((ifi->ifi_flags & IFF_LOWER_UP) && !iface->has_link) {
 		log_info("%s: got link", ifname);
-		iface->has_link = 1;
 	}
+	iface->has_link = !!(ifi->ifi_flags & IFF_LOWER_UP);
 }
 
 static void netlink_link_del_cb(struct nlmsghdr *msg)
 {
 	struct pingu_iface *iface;
+	struct pingu_iface_family *states[2];
 	struct ifinfomsg *ifi = NLMSG_DATA(msg);
 	struct rtattr *rta[IFLA_MAX+1];
 	const char *ifname;
+	int i;
 
 	netlink_parse_rtattr(rta, IFLA_MAX, IFLA_RTA(ifi), IFLA_PAYLOAD(msg));
 	if (rta[IFLA_IFNAME] == NULL)
@@ -581,60 +607,73 @@ static void netlink_link_del_cb(struct nlmsghdr *msg)
 		return;
 
 	log_info("Interface '%s' deleted", ifname);
+	kernel_cleanup_iface_routes(iface);
+	states[0] = &iface->ipv4;
+	states[1] = &iface->ipv6;
+	for (i = 0; i < 2; i++) {
+		struct pingu_iface_addr *addr, *next;
+		list_for_each_entry_safe(addr, next, &states[i]->addresses, entry) {
+			list_del(&addr->entry);
+			free(addr);
+		}
+		memset(&states[i]->primary_addr, 0, sizeof(states[i]->primary_addr));
+		states[i]->has_binding = 0;
+	}
+	pingu_route_del_all(&iface->route_list);
 	iface->index = 0;
 	iface->has_link = 0;
 	pingu_host_iface_deleted(iface);
 }
 
-static void netlink_addr_new_cb(struct nlmsghdr *msg)
+static void netlink_addr_cb(struct nlmsghdr *msg, int add)
 {
 	struct pingu_iface *iface;
+	struct pingu_iface_family *state;
 	struct ifaddrmsg *ifa = NLMSG_DATA(msg);
-	struct rtattr *rta[IFA_MAX+1];
+	struct rtattr *rta[IFA_MAX+1], *address;
+	union sockaddr_any old;
+	unsigned int flags = ifa->ifa_flags;
 	int err;
 
-	if (ifa->ifa_flags & IFA_F_SECONDARY)
+	if (ifa->ifa_family != AF_INET && ifa->ifa_family != AF_INET6)
 		return;
-
 	netlink_parse_rtattr(rta, IFA_MAX, IFA_RTA(ifa), IFA_PAYLOAD(msg));
-	if (rta[IFA_LOCAL] == NULL)
-		return;
-
+	if (rta[IFA_FLAGS] && RTA_PAYLOAD(rta[IFA_FLAGS]) >= sizeof(flags))
+		memcpy(&flags, RTA_DATA(rta[IFA_FLAGS]), sizeof(flags));
+	/* IFA_LOCAL is often absent on IPv6; IFA_ADDRESS is the local address. */
+	address = rta[IFA_LOCAL] ? rta[IFA_LOCAL] : rta[IFA_ADDRESS];
 	iface = pingu_iface_get_by_index(ifa->ifa_index);
-	if (iface == NULL || rta[IFA_LOCAL] == NULL)
+	if (!iface || !address)
 		return;
-
-	pingu_iface_set_addr(iface, ifa->ifa_family,
-			     RTA_DATA(rta[IFA_LOCAL]),
-			     RTA_PAYLOAD(rta[IFA_LOCAL]));
-	pingu_iface_bind_socket(iface, 1);
-	err = netlink_rule_replace_or_add(&talk_fd, iface);
+	state = pingu_iface_family(iface, ifa->ifa_family);
+	old = state->primary_addr;
+	if (flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED | IFA_F_SECONDARY))
+		add = 0;
+	if (!pingu_iface_update_addr(iface, ifa->ifa_family,
+				     RTA_DATA(address), RTA_PAYLOAD(address), add))
+		return;
+	if (state->has_route_rule) {
+		netlink_rule_del(&talk_fd, iface, &old);
+		state->has_route_rule = 0;
+	}
+	if (!state->primary_addr.sa.sa_family)
+		return;
+	pingu_iface_bind_socket(iface, ifa->ifa_family, 1);
+	err = netlink_rule_replace_or_add(&talk_fd, iface, &state->primary_addr);
 	if (err == 0)
-		iface->has_route_rule = 1;
+		state->has_route_rule = 1;
 	if (err > 0)
-		log_error("%s: Failed to add route rule: %s", iface->name,
-			  strerror(err));
+		log_error("%s: Failed to add route rule: %s", iface->name, strerror(err));
 }
 
-static void netlink_addr_del_cb(struct nlmsghdr *nlmsg)
+static void netlink_addr_new_cb(struct nlmsghdr *msg)
 {
-	struct pingu_iface *iface;
-	struct ifaddrmsg *ifa = NLMSG_DATA(nlmsg);
-	struct rtattr *rta[IFA_MAX+1];
+	netlink_addr_cb(msg, 1);
+}
 
-	if (ifa->ifa_flags & IFA_F_SECONDARY)
-		return;
-
-	netlink_parse_rtattr(rta, IFA_MAX, IFA_RTA(ifa), IFA_PAYLOAD(nlmsg));
-	if (rta[IFA_LOCAL] == NULL)
-		return;
-
-	iface = pingu_iface_get_by_index(ifa->ifa_index);
-	if (iface == NULL)
-		return;
-
-	netlink_rule_del(&talk_fd, iface);
-	pingu_iface_set_addr(iface, 0, NULL, 0);
+static void netlink_addr_del_cb(struct nlmsghdr *msg)
+{
+	netlink_addr_cb(msg, 0);
 }
 
 static struct pingu_route *gw_from_rtmsg(struct pingu_route *gw,
@@ -684,7 +723,8 @@ void route_changed_for_iface(struct pingu_iface *iface,
 	log_route_change(route, iface->route_table, action);
 	/* Kernel will remove the alternate route when we lose the
 	 * address so we don't need try remove it ourselves */
-	if (action != RTM_DELROUTE || iface->has_address)
+	if (action != RTM_DELROUTE ||
+	    pingu_iface_family(iface, route->dest.sa.sa_family)->primary_addr.sa.sa_family)
 		err = netlink_route_modify(&talk_fd, action, route,
 					   iface->route_table);
 	if (err > 0)
@@ -707,7 +747,7 @@ static void netlink_route_cb_action(struct nlmsghdr *msg, int action)
 		return;
 
 	netlink_parse_rtattr(rta, RTA_MAX, RTM_RTA(rtm), RTM_PAYLOAD(msg));
-	if (rta[RTA_OIF] == NULL || rtm->rtm_family != PF_INET
+	if (rta[RTA_OIF] == NULL || (rtm->rtm_family != AF_INET && rtm->rtm_family != AF_INET6)
 	    || rtm->rtm_table != RT_TABLE_MAIN)
 		return;
 
@@ -744,7 +784,7 @@ static void netlink_read_cb(struct ev_loop *loop, struct ev_io *w, int revents)
 	struct netlink_fd *nfd = container_of(w, struct netlink_fd, io);
 
 	if (revents & EV_READ)
-		netlink_receive(nfd, NULL);
+		netlink_receive(nfd, NULL, FALSE);
 }
 
 static void netlink_close(struct ev_loop *loop, struct netlink_fd *fd)
@@ -753,7 +793,7 @@ static void netlink_close(struct ev_loop *loop, struct netlink_fd *fd)
 		if (loop != NULL)
 			ev_io_stop(loop, &fd->io);
 		close(fd->fd);
-		fd->fd = 0;
+		fd->fd = -1;
 	}
 }
 
@@ -809,13 +849,17 @@ int kernel_route_modify(int action, struct pingu_route *route,
 
 int kernel_route_multipath(int action, struct list_head *iface_list, int table)
 {
-	return netlink_route_multipath(&talk_fd, action, iface_list, table);
+	int r4 = netlink_route_multipath(&talk_fd, action, iface_list, table, AF_INET);
+	int r6 = netlink_route_multipath(&talk_fd, action, iface_list, table, AF_INET6);
+	return r4 ? r4 : r6;
 }
 
 int kernel_init(struct ev_loop *loop)
 {
 	int i;
 
+	for (i = 0; i < ARRAY_SIZE(netlink_groups); i++)
+		netlink_fds[i].fd = -1;
 	for (i = 0; i < ARRAY_SIZE(netlink_groups); i++) {
 		netlink_fds[i].dispatch_size = sizeof(route_dispatch) / sizeof(route_dispatch[0]);
 		netlink_fds[i].dispatch = route_dispatch;
@@ -824,23 +868,12 @@ int kernel_init(struct ev_loop *loop)
 			goto err_close_all;
 	}
 
-	netlink_enumerate(&talk_fd, PF_UNSPEC, RTM_GETLINK);
-	netlink_read_cb(loop, &talk_fd.io, EV_READ);
-
-	netlink_enumerate(&talk_fd, PF_UNSPEC, RTM_GETADDR);
-	netlink_read_cb(loop, &talk_fd.io, EV_READ);
-
-	/* man page netlink(7) says that first created netlink socket will
-	 * get the getpid() assigned as nlmsg_pid. This is our talk_fd.
-	 *
-	 * Our route callbacks will ignore route changes made by ourselves
-	 * (nlmsg_pid == getpid()) but we still need to get the initial
-	 * route enumration. Therefore we use another netlink socket to
-	 * "pretend" that it was not us who created those routes and the
-	 * route callback will pick them up.
-	 */
-	netlink_enumerate(&netlink_fds[1], PF_UNSPEC, RTM_GETROUTE);
-	netlink_read_cb(loop, &talk_fd.io, EV_READ);
+	/* Dumps use a separate socket: callbacks may issue synchronous requests
+	 * on talk_fd, and route callbacks ignore our own talk_fd notifications. */
+	if (!netlink_enumerate(&netlink_fds[1], AF_UNSPEC, RTM_GETLINK) ||
+	    !netlink_enumerate(&netlink_fds[1], AF_UNSPEC, RTM_GETADDR) ||
+	    !netlink_enumerate(&netlink_fds[1], AF_UNSPEC, RTM_GETROUTE))
+		goto err_close_all;
 
 	return TRUE;
 
@@ -853,15 +886,18 @@ err_close_all:
 
 void kernel_cleanup_iface_routes(struct pingu_iface *iface)
 {
-	int err = 0;
-	if (iface->has_route_rule) {
-		err = netlink_rule_del(&talk_fd, iface);
-		if (err == 0)
-			iface->has_route_rule = 0;
-		if (err > 0)
-			log_error("Failed to delete route rule for %s", iface->name);
-		netlink_route_flush(&talk_fd, iface);
+	struct pingu_iface_family *states[] = { &iface->ipv4, &iface->ipv6 };
+	int i;
+	for (i = 0; i < 2; i++) {
+		if (states[i]->has_route_rule) {
+			int err = netlink_rule_del(&talk_fd, iface, &states[i]->primary_addr);
+			if (err == 0)
+				states[i]->has_route_rule = 0;
+			if (err > 0)
+				log_error("Failed to delete route rule for %s", iface->name);
+		}
 	}
+	netlink_route_flush(&talk_fd, iface);
 }
 
 void kernel_close(void)
@@ -870,4 +906,3 @@ void kernel_close(void)
 	for (i = 0; i < ARRAY_SIZE(netlink_groups); i++)
 		netlink_close(NULL, &netlink_fds[i]);
 }
-

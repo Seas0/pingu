@@ -1,353 +1,339 @@
-#include <time.h>
 #include <errno.h>
-#include <netdb.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <netinet/ip_icmp.h>
-#include <sys/types.h>
+#include <netinet/icmp6.h>
 
 #include "icmp.h"
+#include "sockaddr_util.h"
 
-static char *pr_addr(__u32 addr)
+static uint16_t in_cksum(const void *data, size_t len)
 {
-	static char buf[4096];
+	const unsigned char *p = data;
+	uint32_t sum = 0;
 
-	sprintf(buf, "%s", inet_ntoa(*(struct in_addr *)&addr));
-	return buf;
-}
-
-static void pr_icmph(__u8 type, __u8 code, __u32 info, struct icmphdr *icp)
-{
-	switch (type) {
-	case ICMP_ECHOREPLY:
-		printf("Echo Reply\n");
-		/* XXX ID + Seq + Data */
-		break;
-	case ICMP_DEST_UNREACH:
-		switch(code) {
-		case ICMP_NET_UNREACH:
-			printf("Destination Net Unreachable\n");
-			break;
-		case ICMP_HOST_UNREACH:
-			printf("Destination Host Unreachable\n");
-			break;
-		case ICMP_PROT_UNREACH:
-			printf("Destination Protocol Unreachable\n");
-			break;
-		case ICMP_PORT_UNREACH:
-			printf("Destination Port Unreachable\n");
-			break;
-		case ICMP_FRAG_NEEDED:
-			printf("Frag needed and DF set (mtu = %u)\n", info);
-			break;
-		case ICMP_SR_FAILED:
-			printf("Source Route Failed\n");
-			break;
-		case ICMP_PKT_FILTERED:
-			printf("Packet filtered\n");
-			break;
-		default:
-			printf("Dest Unreachable, Bad Code: %d\n", code);
-			break;
-		}
-		break;
-	case ICMP_SOURCE_QUENCH:
-		printf("Source Quench\n");
-		break;
-	case ICMP_REDIRECT:
-		switch(code) {
-		case ICMP_REDIR_NET:
-			printf("Redirect Network");
-			break;
-		case ICMP_REDIR_HOST:
-			printf("Redirect Host");
-			break;
-		case ICMP_REDIR_NETTOS:
-			printf("Redirect Type of Service and Network");
-			break;
-		case ICMP_REDIR_HOSTTOS:
-			printf("Redirect Type of Service and Host");
-			break;
-		default:
-			printf("Redirect, Bad Code: %d", code);
-			break;
-		}
-		if (icp)
-			printf("(New nexthop: %s)\n", pr_addr(icp->un.gateway));
-		break;
-	case ICMP_ECHO:
-		printf("Echo Request\n");
-		/* XXX ID + Seq + Data */
-		break;
-	case ICMP_TIME_EXCEEDED:
-		switch(code) {
-		case ICMP_EXC_TTL:
-			printf("Time to live exceeded\n");
-			break;
-		case ICMP_EXC_FRAGTIME:
-			printf("Frag reassembly time exceeded\n");
-			break;
-		default:
-			printf("Time exceeded, Bad Code: %d\n", code);
-			break;
-		}
-		break;
-	case ICMP_PARAMETERPROB:
-		printf("Parameter problem: pointer = %u\n", icp ? (ntohl(icp->un.gateway)>>24) : info);
-		break;
-	case ICMP_TIMESTAMP:
-		printf("Timestamp\n");
-		/* XXX ID + Seq + 3 timestamps */
-		break;
-	case ICMP_TIMESTAMPREPLY:
-		printf("Timestamp Reply\n");
-		/* XXX ID + Seq + 3 timestamps */
-		break;
-	case ICMP_INFO_REQUEST:
-		printf("Information Request\n");
-		/* XXX ID + Seq */
-		break;
-	case ICMP_INFO_REPLY:
-		printf("Information Reply\n");
-		/* XXX ID + Seq */
-		break;
-#ifdef ICMP_MASKREQ
-	case ICMP_MASKREQ:
-		printf("Address Mask Request\n");
-		break;
-#endif
-#ifdef ICMP_MASKREPLY
-	case ICMP_MASKREPLY:
-		printf("Address Mask Reply\n");
-		break;
-#endif
-	default:
-		printf("Bad ICMP type: %d\n", type);
+	while (len > 1) {
+		sum += (p[0] << 8) | p[1];
+		p += 2;
+		len -= 2;
 	}
+	if (len)
+		sum += p[0] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return htons(~sum);
 }
 
-static u_short in_cksum(const u_short *addr, register int len, u_short csum)
+/* Locate ICMP in an IP packet, including the packet quoted by an error. */
+static int icmp_offset(const unsigned char *buf, int len, int family)
 {
-	const u_short *w = addr;
-	u_short answer;
-	int sum = csum, nleft = len;
+	int offset, next;
 
-	while (nleft > 1)  {
-		sum += *w++;
-		nleft -= 2;
+	if (family == AF_INET) {
+		struct iphdr ip;
+		if (len < (int)sizeof(ip))
+			return -1;
+		memcpy(&ip, buf, sizeof(ip));
+		offset = ip.ihl * 4;
+		if (ip.version != 4 || offset < (int)sizeof(ip) ||
+		    offset > len || ip.protocol != IPPROTO_ICMP ||
+		    (ntohs(ip.frag_off) & IP_OFFMASK))
+			return -1;
+		return offset;
 	}
+	if (family != AF_INET6 || len < (int)sizeof(struct ip6_hdr) ||
+	    (buf[0] >> 4) != 6)
+		return -1;
 
-	if (nleft == 1)
-		sum += htons(*(u_char *)w << 8);
-
-	sum = (sum >> 16) + (sum & 0xffff);	/* add hi 16 to low 16 */
-	sum += (sum >> 16);			/* add carry */
-	answer = ~sum;				/* truncate to 16 bits */
-
-	return answer;
+	next = buf[6];
+	offset = sizeof(struct ip6_hdr);
+	while (next != IPPROTO_ICMPV6) {
+		int size;
+		if (len - offset < 8)
+			return -1;
+		switch (next) {
+		case IPPROTO_HOPOPTS:
+		case IPPROTO_ROUTING:
+		case IPPROTO_DSTOPTS:
+			size = (buf[offset + 1] + 1) * 8;
+			break;
+		case IPPROTO_AH:
+			size = (buf[offset + 1] + 2) * 4;
+			break;
+		case IPPROTO_FRAGMENT:
+			/* A non-initial fragment cannot quote an echo header. */
+			if (buf[offset + 2] || (buf[offset + 3] & 0xf8))
+				return -1;
+			size = 8;
+			break;
+		default:
+			return -1;
+		}
+		if (size > len - offset)
+			return -1;
+		next = buf[offset];
+		offset += size;
+	}
+	return offset;
 }
 
-
-int icmp_parse_reply(__u8 *buf, int len, int seq,
-		     struct sockaddr *addr,
-		     struct sockaddr *origdest)
+int icmp_parse_reply(__u8 *buf, int len, int seq, struct sockaddr *addr,
+		     struct sockaddr *origdest, struct icmp_reply *reply)
 {
-	struct sockaddr_in *from = (struct sockaddr_in *) addr;
-	struct sockaddr_in *to = (struct sockaddr_in *) origdest;
-	struct icmphdr *icp;
-	struct iphdr *ip;
-	int hlen, csfailed;
+	struct icmp6_hdr header, echo;
+	int family = addr->sa_family;
+	int offset, quoted;
 
-	/* Check the IP header */
-	ip = (struct iphdr *) buf;
-	hlen = ip->ihl * 4;
-	if (len < hlen + 8 || ip->ihl < 5)
+	memset(reply, 0, sizeof(*reply));
+	/* Linux raw IPv6 sockets return the payload without the IP header.
+	 * The kernel also verifies and generates the ICMPv6 checksum. */
+	if (family == AF_INET6)
+		offset = 0;
+	else if (family == AF_INET)
+		offset = icmp_offset(buf, len, family);
+	else
 		return 1;
-
-	/* Now the ICMP part */
-	len -= hlen;
-	icp = (struct icmphdr *)(buf + hlen);
-	csfailed = in_cksum((u_short *)icp, len, 0);
-
-	if (icp->type == ICMP_ECHOREPLY) {
-		if (icp->un.echo.id != getpid() ||
-		    ntohs(icp->un.echo.sequence) != seq)
-			return 1;			/* 'Twas not our ECHO */
-
-		printf("From %s: icmp_seq=%u bytes=%d\n",
-		       pr_addr(from->sin_addr.s_addr),
-		       ntohs(icp->un.echo.sequence), len);
-	} else {
-		/* We fall here when a redirect or source quench arrived.
-		 * Also this branch processes icmp errors, when IP_RECVERR
-		 * is broken. */
-
-		switch (icp->type) {
-		case ICMP_ECHO:
-			/* MUST NOT */
+	if (offset < 0 || len - offset < (int)sizeof(header))
+		return 1;
+	if (family == AF_INET && in_cksum(buf + offset, len - offset))
+		return 1;
+	memcpy(&header, buf + offset, sizeof(header));
+	reply->bytes = len - offset;
+	reply->info = ntohl(header.icmp6_data32[0]);
+	reply->type = header.icmp6_type;
+	reply->code = header.icmp6_code;
+	reply->echo_reply = header.icmp6_type ==
+		(family == AF_INET6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY);
+	echo = header;
+	if (reply->echo_reply) {
+		if (header.icmp6_code != 0 || (origdest &&
+		    sockaddr_cmp((union sockaddr_any *)addr,
+				 (union sockaddr_any *)origdest)))
 			return 1;
-		case ICMP_SOURCE_QUENCH:
-		case ICMP_REDIRECT:
-		case ICMP_DEST_UNREACH:
-		case ICMP_TIME_EXCEEDED:
-		case ICMP_PARAMETERPROB:
-			{
-				struct iphdr * iph = (struct  iphdr *)(&icp[1]);
-				struct icmphdr *icp1 = (struct icmphdr*)((unsigned char *)iph + iph->ihl*4);
-				int error_pkt;
-				if (len < 8 + sizeof(struct iphdr) + 8 ||
-				    len < 8 + iph->ihl * 4 + 8)
+	} else {
+		if (!origdest || origdest->sa_family != family)
+			return 1;
+		if (family == AF_INET6) {
+			struct ip6_hdr ip;
+			if (header.icmp6_type != ICMP6_PACKET_TOO_BIG &&
+			    header.icmp6_type != ICMP6_DST_UNREACH &&
+			    header.icmp6_type != ICMP6_TIME_EXCEEDED &&
+			    header.icmp6_type != ICMP6_PARAM_PROB)
+				return 1;
+			offset += sizeof(header);
+			if (len - offset < (int)sizeof(ip))
+				return 1;
+			memcpy(&ip, buf + offset, sizeof(ip));
+			if (memcmp(&ip.ip6_dst,
+				   &((struct sockaddr_in6 *)origdest)->sin6_addr,
+				   sizeof(ip.ip6_dst)))
+				return 1;
+			if (header.icmp6_type == ICMP6_PACKET_TOO_BIG) {
+				if (header.icmp6_code)
 					return 1;
-				if (icp1->type != ICMP_ECHO ||
-				    iph->daddr != to->sin_addr.s_addr ||
-				    icp1->un.echo.id != getpid() ||
-				    ntohs(icp1->un.echo.sequence) != seq)
-					return 1;
-				error_pkt = (icp->type != ICMP_REDIRECT &&
-					     icp->type != ICMP_SOURCE_QUENCH);
-				if (error_pkt) {
-					//acknowledge(ntohs(icp1->un.echo.sequence));
-				}
-
-				printf("From %s: icmp_seq=%u ",
-				       pr_addr(from->sin_addr.s_addr),
-				       ntohs(icp1->un.echo.sequence));
-				if (csfailed)
-					printf("(BAD CHECKSUM)");
-				pr_icmph(icp->type, icp->code, ntohl(icp->un.gateway), icp);
-				return !error_pkt;
+				reply->mtu = ntohl(header.icmp6_mtu);
 			}
-		default:
-			/* MUST NOT */
-			break;
+		} else {
+			struct iphdr ip;
+			if (header.icmp6_type != ICMP_DEST_UNREACH &&
+			    header.icmp6_type != ICMP_TIME_EXCEEDED &&
+			    header.icmp6_type != ICMP_PARAMETERPROB)
+				return 1;
+			offset += sizeof(header);
+			if (len - offset < (int)sizeof(ip))
+				return 1;
+			memcpy(&ip, buf + offset, sizeof(ip));
+			if (ip.daddr != ((struct sockaddr_in *)origdest)->sin_addr.s_addr)
+				return 1;
+			if (header.icmp6_type == ICMP_DEST_UNREACH &&
+			    header.icmp6_code == ICMP_FRAG_NEEDED)
+				reply->mtu = ntohs(header.icmp6_data16[1]);
 		}
-		printf("From %s: ", pr_addr(from->sin_addr.s_addr));
-		pr_icmph(icp->type, icp->code, ntohl(icp->un.gateway), icp);
-		return 0;
+		quoted = icmp_offset(buf + offset, len - offset, family);
+		if (quoted < 0 || len - offset - quoted < (int)sizeof(echo))
+			return 1;
+		memcpy(&echo, buf + offset + quoted, sizeof(echo));
+		if (echo.icmp6_type != (family == AF_INET6 ? ICMP6_ECHO_REQUEST : ICMP_ECHO) ||
+		    echo.icmp6_code != 0)
+			return 1;
 	}
-
+	reply->seq = ntohs(echo.icmp6_seq);
+	if (echo.icmp6_id != htons((uint16_t)getpid()) ||
+	    (seq >= 0 && reply->seq != seq))
+		return 1;
 	return 0;
 }
 
 int icmp_send(int fd, struct sockaddr *to, int tolen, void *buf, int buflen)
 {
-	int i;
-
-	i = sendto(fd, buf, buflen, 0, to, tolen);
-	if (i != buflen)
-		return -1;
-
-	return 0;
+	return sendto(fd, buf, buflen, 0, to, tolen) == buflen ? 0 : -1;
 }
 
 int icmp_send_frag_needed(int fd, struct sockaddr *to, int tolen,
-			  struct iphdr *iph, int newmtu)
+			  const void *original, int original_len,
+			  struct sockaddr *local, int newmtu)
 {
-	struct sockaddr_in *to_in = (struct sockaddr_in *) to;
-	const int len = sizeof(struct icmphdr) + sizeof(struct iphdr) + 8;
-	char packet[len];
-	struct icmphdr *icp;
+	unsigned char packet[1280 - sizeof(struct ip6_hdr)] = { 0 };
+	struct icmp6_hdr *icmp = (void *)packet;
+	int len;
 
-	icp = (struct icmphdr *) packet;
-	icp->type = ICMP_DEST_UNREACH;
-	icp->code = ICMP_FRAG_NEEDED;
-	icp->checksum = 0;
-	icp->un.frag.mtu = htons(newmtu);
-
-	/* copy ip header + 64-bits of original packet */
-	memcpy(icp + 1, iph, sizeof(struct iphdr) + 8);
-
-	icp->checksum = in_cksum((u_short *) icp, len, 0);
-
-	printf("To %s: frag_needed mtu=%d\n",
-	       pr_addr(to_in->sin_addr.s_addr), newmtu);
-
+	if (to->sa_family == AF_INET6) {
+		struct ip6_hdr *ip = (void *)(icmp + 1);
+		int maxquote = sizeof(packet) - sizeof(*icmp) - sizeof(*ip);
+		if (!local || local->sa_family != AF_INET6 || original_len < 8 ||
+		    newmtu < 1280)
+			return -1;
+		icmp->icmp6_type = ICMP6_PACKET_TOO_BIG;
+		icmp->icmp6_mtu = htonl(newmtu);
+		/* Raw ICMPv6 receives no IP header: reconstruct it from pktinfo. */
+		ip->ip6_vfc = 0x60;
+		ip->ip6_plen = htons(original_len);
+		ip->ip6_nxt = IPPROTO_ICMPV6;
+		ip->ip6_hlim = 64;
+		ip->ip6_src = ((struct sockaddr_in6 *)to)->sin6_addr;
+		ip->ip6_dst = ((struct sockaddr_in6 *)local)->sin6_addr;
+		if (original_len > maxquote)
+			original_len = maxquote;
+		memcpy(ip + 1, original, original_len);
+		len = sizeof(*icmp) + sizeof(*ip) + original_len;
+	} else if (to->sa_family == AF_INET) {
+		int hlen = icmp_offset(original, original_len, AF_INET);
+		if (hlen < 0 || original_len < hlen + 8)
+			return -1;
+		icmp->icmp6_type = ICMP_DEST_UNREACH;
+		icmp->icmp6_code = ICMP_FRAG_NEEDED;
+		icmp->icmp6_data16[1] = htons(newmtu);
+		len = sizeof(*icmp) + hlen + 8;
+		memcpy(icmp + 1, original, hlen + 8);
+		icmp->icmp6_cksum = in_cksum(packet, len);
+	} else {
+		return -1;
+	}
 	return icmp_send(fd, to, tolen, packet, len);
 }
 
 int icmp_send_ping(int fd, struct sockaddr *to, int tolen,
-		   int seq, int total_size)
+		   int seq, int total_size, const struct sockaddr *source)
 {
-	__u8 packet[1500];
-	struct icmphdr *icp;
-	int len;
+	unsigned char packet[ICMP_MAX_PACKET_SIZE];
+	struct icmp6_hdr *icmp = (void *)packet;
+	int hlen, len;
 
-	if (total_size > sizeof(packet))
+	if (to->sa_family != AF_INET && to->sa_family != AF_INET6) {
+		errno = EAFNOSUPPORT;
 		return -1;
-	if (total_size < sizeof(struct iphdr) + sizeof(struct icmphdr))
-		total_size = sizeof(struct iphdr) + sizeof(struct icmphdr);
-
-	len = total_size - sizeof(struct iphdr);
-	memset(packet, 0, sizeof(packet));
-
-	icp = (struct icmphdr *) packet;
-	icp->type = ICMP_ECHO;
-	icp->code = 0;
-	icp->checksum = 0;
-	icp->un.echo.sequence = htons(seq);
-	icp->un.echo.id = getpid();
-	icp->checksum = in_cksum((u_short *) icp, len, 0);
-#if 0
-	printf("To %s: icmp_seq=%u bytes=%d\n",
-	       pr_addr(to_in->sin_addr.s_addr), seq, len);
-#endif
-	return icmp_send(fd, to, tolen, (void *) packet, len);
+	}
+	hlen = to->sa_family == AF_INET6 ? sizeof(struct ip6_hdr) : sizeof(struct iphdr);
+	if (total_size > (int)sizeof(packet)) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	if (total_size < hlen + (int)sizeof(*icmp))
+		total_size = hlen + sizeof(*icmp);
+	len = total_size - hlen;
+	memset(packet, 0, len);
+	icmp->icmp6_type = to->sa_family == AF_INET6 ? ICMP6_ECHO_REQUEST : ICMP_ECHO;
+	icmp->icmp6_seq = htons(seq);
+	icmp->icmp6_id = htons((uint16_t)getpid());
+	if (to->sa_family == AF_INET)
+		icmp->icmp6_cksum = in_cksum(packet, len);
+	if (source && source->sa_family == AF_INET6) {
+		union {
+			struct cmsghdr align;
+			char buf[CMSG_SPACE(sizeof(struct in6_pktinfo))];
+		} control = { 0 };
+		struct iovec iov = { .iov_base = packet, .iov_len = len };
+		struct msghdr msg = {
+			.msg_name = to, .msg_namelen = tolen,
+			.msg_iov = &iov, .msg_iovlen = 1,
+			.msg_control = control.buf, .msg_controllen = sizeof(control.buf),
+		};
+		struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+		struct in6_pktinfo *info = (void *)CMSG_DATA(cmsg);
+		const struct sockaddr_in6 *sin6 = (const void *)source;
+		cmsg->cmsg_level = IPPROTO_IPV6;
+		cmsg->cmsg_type = IPV6_PKTINFO;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(*info));
+		info->ipi6_addr = sin6->sin6_addr;
+		info->ipi6_ifindex = sin6->sin6_scope_id;
+		return sendmsg(fd, &msg, 0) == len ? 0 : -1;
+	}
+	return icmp_send(fd, to, tolen, packet, len);
 }
 
 int icmp_read_reply(int fd, struct sockaddr *from, socklen_t fromlen,
-		    __u8 *buf, int buflen)
+		    __u8 *buf, int buflen, struct sockaddr *local)
 {
-	int len;
+	union {
+		struct cmsghdr align;
+		char buf[CMSG_SPACE(sizeof(struct in6_pktinfo))];
+	} control;
+	struct iovec iov = { .iov_base = buf, .iov_len = buflen };
+	struct msghdr msg = {
+		.msg_name = from, .msg_namelen = fromlen,
+		.msg_iov = &iov, .msg_iovlen = 1,
+		.msg_control = control.buf, .msg_controllen = sizeof(control.buf),
+	};
+	struct cmsghdr *cmsg;
+	int len = recvmsg(fd, &msg, 0);
 
-	len = recvfrom(fd, buf, buflen, 0, from, &fromlen);
-	if (len < 0) {
-		if (errno == EAGAIN || errno == EINTR)
-			return 0;
-		return -1;
+	if (len < 0)
+		return errno == EAGAIN || errno == EINTR ? 0 : -1;
+	if (msg.msg_flags & MSG_TRUNC)
+		return 0;
+	if (local) {
+		local->sa_family = AF_UNSPEC;
+		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+			if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
+			    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+				struct in6_pktinfo *info = (void *)CMSG_DATA(cmsg);
+				struct sockaddr_in6 *sin6 = (void *)local;
+				memset(sin6, 0, sizeof(*sin6));
+				sin6->sin6_family = AF_INET6;
+				sin6->sin6_addr = info->ipi6_addr;
+				sin6->sin6_scope_id = info->ipi6_ifindex;
+			}
+		}
 	}
-
 	return len;
 }
 
-int icmp_open(float timeout)
+int icmp_open(int family, float timeout)
 {
-	const int pmtudisc = IP_PMTUDISC_DO;
+	int v6 = family == AF_INET6;
+	int pmtudisc = v6 ? IPV6_PMTUDISC_DO : IP_PMTUDISC_DO;
+	int on = 1;
 	struct timeval tv;
-	int fd;
+	int fd = socket(family, SOCK_RAW, v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
 
-	fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 	if (fd < 0) {
-		perror("mtuinject: socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)");
-		goto err;
+		perror("mtu: socket");
+		return -1;
 	}
-
-	if (setsockopt(fd, SOL_IP, IP_MTU_DISCOVER,
-		       &pmtudisc, sizeof(pmtudisc)) == -1) {
-		perror("ping: IP_MTU_DISCOVER");
+	if (setsockopt(fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP,
+		       v6 ? IPV6_MTU_DISCOVER : IP_MTU_DISCOVER,
+		       &pmtudisc, sizeof(pmtudisc)) < 0)
 		goto err_close;
-	}
-
-	tv.tv_sec = (time_t) timeout;
-	tv.tv_usec = (timeout - tv.tv_sec) * 1000000;
-	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof(tv));
-
-	tv.tv_sec = (time_t) timeout;
-	tv.tv_usec = (timeout - tv.tv_sec) * 1000000;
-	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
-		       (char*)&tv, sizeof(tv)) == -1)
+	if (v6 && setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on)) < 0)
 		goto err_close;
-
+	tv.tv_sec = (time_t)timeout;
+	tv.tv_usec = (timeout - tv.tv_sec) * 1000000;
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0 ||
+	    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+		goto err_close;
 	return fd;
 
 err_close:
+	perror("mtu: setsockopt");
 	close(fd);
-err:
 	return -1;
 }
 
@@ -355,4 +341,3 @@ void icmp_close(int fd)
 {
 	close(fd);
 }
-

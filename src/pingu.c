@@ -208,7 +208,8 @@ int main(int argc, char *argv[])
 			return 1;
 	}
 
-	kernel_init(loop);
+	if (!kernel_init(loop))
+		return 1;
 	ev_signal_init(&signal_watcher, sigint_cb, SIGINT);
 	ev_signal_start(loop, &signal_watcher);
 
@@ -220,4 +221,3 @@ int main(int argc, char *argv[])
 	ev_loop_destroy(loop);
 	return 0;
 }
-

@@ -26,4 +26,10 @@ install clean:
 		$(MAKE) -C $$dir $@ || break; \
 	done
 
-.PHONY: $(SUBDIRS) all install clean
+check:
+	$(MAKE) -C src check
+
+check-integration: src
+	python3 tests/integration.py
+
+.PHONY: $(SUBDIRS) all install clean check check-integration

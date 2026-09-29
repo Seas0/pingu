@@ -15,6 +15,7 @@ struct pingu_conf {
 	int lineno;
 };
 
+static int default_family = AF_UNSPEC;
 static float default_burst_interval = 30.0;
 static float default_timeout = 1.0;
 static int default_max_retries = 5;
@@ -112,10 +113,13 @@ static char *pingu_conf_read_key_value(struct pingu_conf *conf, char **key,
 
 static struct pingu_host *pingu_conf_new_host(const char *hoststr)
 {
-	return pingu_host_new(xstrdup(hoststr), default_burst_interval,
+	struct pingu_host *host = pingu_host_new(xstrdup(hoststr), default_burst_interval,
 			      default_max_retries, default_required_replies,
 			      default_timeout, default_up_action,
 			      default_down_action);
+	if (host)
+		host->family = default_family;
+	return host;
 }
 
 static int pingu_conf_parse_int(struct pingu_conf *conf, const char *str,
@@ -129,6 +133,22 @@ static int pingu_conf_parse_int(struct pingu_conf *conf, const char *str,
 	if (r != 1) {
 		log_error("%s: Invalid integer value '%s' (line %i)",
 			  conf->filename, str, conf->lineno);
+		return -1;
+	}
+	return 0;
+}
+
+static int pingu_conf_parse_family(struct pingu_conf *conf, const char *value, int *family)
+{
+	if (value && strcmp(value, "inet") == 0)
+		*family = AF_INET;
+	else if (value && strcmp(value, "inet6") == 0)
+		*family = AF_INET6;
+	else if (value && strcmp(value, "any") == 0)
+		*family = AF_UNSPEC;
+	else {
+		log_error("%s: family must be any, inet or inet6 (line %i)",
+			  conf->filename, conf->lineno);
 		return -1;
 	}
 	return 0;
@@ -216,7 +236,9 @@ static int pingu_conf_read_host(struct pingu_conf *conf, char *hoststr)
 	while (pingu_conf_read_key_value(conf, &key, &value)) {
 		if (key == NULL || key[0] == '}')
 			break;
-		if (strcmp(key, "bind-interface") == 0) {
+		if (strcmp(key, "family") == 0) {
+			r += pingu_conf_parse_family(conf, value, &host->family);
+		} else if (strcmp(key, "bind-interface") == 0) {
 			host->iface = pingu_iface_get_by_name_or_new(value);
 			if (host->iface == NULL) {
 				log_error("%s: Interface failure %s (line %i)",
@@ -258,7 +280,9 @@ int pingu_conf_parse(const char *filename)
 		return -1;
 
 	while (pingu_conf_read_key_value(conf, &key, &value)) {
-		if (strcmp(key, "interface") == 0) {
+		if (strcmp(key, "family") == 0) {
+			r += pingu_conf_parse_family(conf, value, &default_family);
+		} else if (strcmp(key, "interface") == 0) {
 			r += pingu_conf_read_iface(conf, chomp_bracket(value));
 			if (r < 0)
 				break;

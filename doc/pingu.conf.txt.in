@@ -25,6 +25,10 @@ global context can be overridden in interface and host sections.
 *interval*::
 Set the default ping burst interval
 
+*family*::
+	The default address family for ping hosts: *any* (default), *inet*
+	(IPv4) or *inet6* (IPv6).
+
 *timeout*::
 	The default ping timout value in seconds. If the ping response does
 	not come back within "timeout" seconds the ping is considered lost.
@@ -72,7 +76,8 @@ The keywords valid in an interface sections are:
 
 *required-hosts-online*::
 	The minimum number of ping hosts that needs to be online to consider
-	the gateway online.
+	the gateway online. Hosts from both address families count toward this
+	threshold; gateway transitions affect both IPv4 and IPv6 default routes.
 
 *route-table*::
 	The alternate route table for this interface.
@@ -82,7 +87,9 @@ The keywords valid in an interface sections are:
 
 *ping*::
 	Host to ping to verify that gateway is still up. This is the same as
-	defining a host and bind it to interface.
+	defining a host and bind it to interface. Accepts DNS names, IPv4 and
+	IPv6 addresses. Link-local IPv6 addresses use this interface as their
+	scope; an explicit '%interface' suffix must match the bound interface.
 
 *fwmark*::
 	Add an additional route rule for configured fwmark integer.
@@ -100,6 +107,12 @@ host 1.2.3.4 {
 
 *bind-interface*::
 	Bind the pings to this interface.
+
+*family*::
+	Resolve this host using *any*, *inet* or *inet6*. With *any*, addresses
+	are tried in resolver order until a probe can be sent. To monitor both
+	families independently, configure a separate host for each family.
+	An unbound link-local IPv6 target requires a '%interface' suffix.
 
 *down-action*::
 	Execute this action when ping host goes offline.
@@ -127,4 +140,3 @@ host 1.2.3.4 {
 AUTHORS
 -------
 Natanael Copa
-

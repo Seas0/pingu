@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <linux/rtnetlink.h>
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,53 +38,80 @@ unsigned char used_route_table[256];
 /* do we have any load-balance at all? */
 static int load_balanced = 0;
 
+struct pingu_iface_family *pingu_iface_family(struct pingu_iface *iface, int family)
+{
+	switch (family) {
+	case AF_INET:
+		return &iface->ipv4;
+	case AF_INET6:
+		return &iface->ipv6;
+	}
+	return NULL;
+}
+
 static void pingu_iface_socket_cb(struct ev_loop *loop, struct ev_io *w,
 				 int revents)
 {
-	struct pingu_iface *iface = container_of(w, struct pingu_iface, socket_watcher);
+	struct pingu_iface_family *state = container_of(w, struct pingu_iface_family, socket_watcher);
 
 	if (revents & EV_READ)
-		pingu_ping_read_reply(loop, iface);
+		pingu_ping_read_reply(loop, state->iface, state->family);
 }
 
-int pingu_iface_bind_socket(struct pingu_iface *iface, int log_error)
+int pingu_iface_bind_socket(struct pingu_iface *iface, int family, int log_error)
 {
+	struct pingu_iface_family *state = pingu_iface_family(iface, family);
 	int r;
+
+	if (!state || state->fd < 0)
+		return -1;
 	if (iface->name[0] == '\0')
 		return 0;
-	r = setsockopt(iface->fd, SOL_SOCKET, SO_BINDTODEVICE, iface->name,
-		       strlen(iface->name));
+	state->has_binding = 0;
+	r = setsockopt(state->fd, SOL_SOCKET, SO_BINDTODEVICE, iface->name,
+		       strlen(iface->name) + 1);
+	if (r < 0)
+		goto out;
+	if (state->primary_addr.sa.sa_family != family)
+		return -1;
+	/* IPv6 uses per-packet source addresses so link-local and global
+	 * probes can share the socket without changing its receive filter. */
+	if (family == AF_INET)
+		r = bind(state->fd, &state->primary_addr.sa,
+			 sockaddr_len(&state->primary_addr));
+out:
 	if (r < 0 && log_error)
 		log_perror(iface->name);
-
-	r = bind(iface->fd, &iface->primary_addr.sa,
-		 sockaddr_len(&iface->primary_addr));
-	if (r < 0 && log_error)
-		log_perror(iface->name);
-	iface->has_binding = (r == 0);
+	state->has_binding = (r == 0);
 	return r;
 }
 
 static int pingu_iface_init_socket(struct ev_loop *loop,
-				   struct pingu_iface *iface)
+				   struct pingu_iface_family *state)
 {
-	iface->fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (iface->fd < 0) {
+	state->fd = socket(state->family, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+			   state->family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
+	if (state->fd < 0) {
+		if (state->family == AF_INET6 &&
+		    (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT))
+			return 0;
 		log_perror("socket");
 		return -1;
 	}
 
-	ev_io_init(&iface->socket_watcher, pingu_iface_socket_cb,
-		   iface->fd, EV_READ);
-	ev_io_start(loop, &iface->socket_watcher);
+	ev_io_init(&state->socket_watcher, pingu_iface_socket_cb, state->fd, EV_READ);
+	ev_io_start(loop, &state->socket_watcher);
 	return 0;
 }
 
-int pingu_iface_usable(struct pingu_iface *iface)
+int pingu_iface_usable(struct pingu_iface *iface, int family)
 {
+	struct pingu_iface_family *state = pingu_iface_family(iface, family);
+	if (!state || state->fd < 0)
+		return 0;
 	if (iface->name[0] == '\0')
 		return 1;
-	return iface->has_link && iface->has_address && iface->has_binding;
+	return iface->has_link && state->primary_addr.sa.sa_family == family && state->has_binding;
 }
 
 struct pingu_iface *pingu_iface_get_by_name(const char *name)
@@ -125,26 +153,64 @@ struct pingu_iface *pingu_iface_get_by_name_or_new(const char *name)
 	if (name != NULL)
 		strlcpy(iface->name, name, sizeof(iface->name));
 
+	iface->ipv4.iface = iface->ipv6.iface = iface;
+	iface->ipv4.family = AF_INET;
+	iface->ipv6.family = AF_INET6;
+	iface->ipv4.fd = iface->ipv6.fd = -1;
+	list_init(&iface->ipv4.addresses);
+	list_init(&iface->ipv6.addresses);
 	list_init(&iface->ping_list);
 	list_init(&iface->route_list);
 	list_add(&iface->iface_list_entry, &iface_list);
 	return iface;
 }
 
-void pingu_iface_set_addr(struct pingu_iface *iface, int family,
-			  void *data, int len)
+int pingu_iface_update_addr(struct pingu_iface *iface, int family,
+			    void *data, int len, int add)
 {
-	sockaddr_init(&iface->primary_addr, family, data);
-	if (len <= 0 || data == NULL) {
-		iface->has_address = 0;
-		iface->has_binding = 0;
-		pingu_route_del_all(&iface->route_list);
-		log_debug("%s: address removed", iface->name);
-		return;
+	struct pingu_iface_family *state = pingu_iface_family(iface, family);
+	struct pingu_iface_addr *entry, *next;
+	union sockaddr_any addr, primary;
+	char buf[80];
+	int found = 0;
+
+	if (!state || !data || len != (family == AF_INET6 ? 16 : 4))
+		return 0;
+	sockaddr_init(&addr, family, data);
+	if (family == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&addr.sin6.sin6_addr))
+		addr.sin6.sin6_scope_id = iface->index;
+	list_for_each_entry_safe(entry, next, &state->addresses, entry) {
+		if (sockaddr_cmp(&addr, &entry->addr) != 0)
+			continue;
+		found = 1;
+		if (!add) {
+			list_del(&entry->entry);
+			free(entry);
+		}
+		break;
 	}
-	iface->has_address = 1;
-	log_debug("%s: new address: %s", iface->name,
-		inet_ntoa(iface->primary_addr.sin.sin_addr));
+	if (add && !found) {
+		entry = calloc(1, sizeof(*entry));
+		if (!entry)
+			return 0;
+		entry->addr = addr;
+		list_add_tail(&entry->entry, &state->addresses);
+	}
+	memset(&primary, 0, sizeof(primary));
+	list_for_each_entry(entry, &state->addresses, entry) {
+		if (primary.sa.sa_family == AF_UNSPEC ||
+		    (family == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&primary.sin6.sin6_addr) &&
+		     !IN6_IS_ADDR_LINKLOCAL(&entry->addr.sin6.sin6_addr)))
+			primary = entry->addr;
+	}
+	if (sockaddr_cmp(&primary, &state->primary_addr) == 0)
+		return 0;
+	state->primary_addr = primary;
+	state->has_binding = 0;
+	log_debug("%s: IPv%i primary address: %s", iface->name,
+		  family == AF_INET6 ? 6 : 4,
+		  primary.sa.sa_family ? sockaddr_to_string(&primary, buf, sizeof(buf)) : "removed");
+	return 1;
 }
 
 void pingu_iface_set_balance(struct pingu_iface *iface, int balance_weight)
@@ -203,7 +269,8 @@ void pingu_iface_update_routes(struct pingu_iface *iface, int action,
 {
 	struct pingu_route *route;
 	list_for_each_entry(route, &iface->route_list, route_list_entry) {
-		if (is_default_gw(route) && iface->has_address)
+		if (is_default_gw(route) &&
+		    pingu_iface_family(iface, route->dest.sa.sa_family)->primary_addr.sa.sa_family)
 			kernel_route_modify(action, route, RT_TABLE_MAIN);
 	}
 	if (do_multipath)
@@ -309,7 +376,8 @@ int pingu_iface_init(struct ev_loop *loop)
 	list_for_each_entry(iface, &iface_list, iface_list_entry) {
 		if (iface->route_table == 0)
 			pingu_iface_set_route_table(iface, PINGU_ROUTE_TABLE_AUTO);
-		if (pingu_iface_init_socket(loop, iface) == -1)
+		if (pingu_iface_init_socket(loop, &iface->ipv4) == -1 ||
+		    pingu_iface_init_socket(loop, &iface->ipv6) == -1)
 			return -1;
 	}
 	if (load_balanced == 1)
@@ -332,7 +400,19 @@ void pingu_iface_cleanup(struct ev_loop *loop)
 		if (!pingu_iface_gw_is_online(iface))
 			pingu_iface_update_routes(iface, RTM_NEWROUTE, 0);
 		kernel_cleanup_iface_routes(iface);
-		close(iface->fd);
+		struct pingu_iface_family *states[] = { &iface->ipv4, &iface->ipv6 };
+		int i;
+		for (i = 0; i < 2; i++) {
+			struct pingu_iface_addr *addr, *next;
+			if (states[i]->fd >= 0) {
+				ev_io_stop(loop, &states[i]->socket_watcher);
+				close(states[i]->fd);
+			}
+			list_for_each_entry_safe(addr, next, &states[i]->addresses, entry) {
+				list_del(&addr->entry);
+				free(addr);
+			}
+		}
 	}
 	list_for_each_entry_safe(iface, n, &iface_list, iface_list_entry) {
 		list_del(&iface->iface_list_entry);

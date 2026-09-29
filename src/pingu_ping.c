@@ -69,17 +69,17 @@ static struct pingu_ping *pingu_ping_add(struct ev_loop *loop,
 	return ping;
 }
 
-static struct pingu_ping *pingu_ping_find(struct icmphdr *icp,
+static struct pingu_ping *pingu_ping_find(struct icmp_reply *reply,
 					  union sockaddr_any *from,
 					  struct list_head *ping_list)
 {
 	struct pingu_ping *ping;
-	if (icp->type != ICMP_ECHOREPLY || icp->un.echo.id != getpid())
+	if (!reply->echo_reply)
 		return NULL;
 
 	list_for_each_entry(ping, ping_list, ping_list_entry) {
 		if (sockaddr_cmp(&ping->host->burst.saddr, from) == 0
-		    && ping->seq == ntohs(icp->un.echo.sequence))
+		    && ping->seq == reply->seq)
 			return ping;
 	}
 	return NULL;
@@ -98,16 +98,29 @@ static void pingu_ping_handle_reply(struct ev_loop *loop,
 int pingu_ping_send(struct ev_loop *loop, struct pingu_host *host,
 		    int set_status_on_failure)
 {
-	int packetlen = sizeof(struct iphdr) + sizeof(struct icmphdr);
+	int family = host->burst.saddr.sa.sa_family;
+	struct pingu_iface_family *state = pingu_iface_family(host->iface, family);
+	union sockaddr_any source;
+	struct sockaddr *src = NULL;
 	struct pingu_ping *ping;
 	int seq, r;
 
-	if (!pingu_iface_usable(host->iface))
-		return pingu_host_set_status(host, PINGU_HOST_STATUS_OFFLINE) - 1;
+	if (!pingu_iface_usable(host->iface, family)) {
+		if (set_status_on_failure)
+			pingu_host_set_status(host, PINGU_HOST_STATUS_OFFLINE);
+		return -1;
+	}
+	if (family == AF_INET6 && host->iface->name[0]) {
+		source = state->primary_addr;
+		if (IN6_IS_ADDR_LINKLOCAL(&host->burst.saddr.sin6.sin6_addr))
+			source.sin6.sin6_addr = in6addr_any;
+		source.sin6.sin6_scope_id = host->iface->index;
+		src = &source.sa;
+	}
 
 	seq = pingu_ping_get_seq();
-	r = icmp_send_ping(host->iface->fd, &host->burst.saddr.sa,
-			       sizeof(host->burst.saddr), seq, packetlen);
+	r = icmp_send_ping(state->fd, &host->burst.saddr.sa,
+			       sockaddr_len(&host->burst.saddr), seq, 0, src);
 	if (r < 0) {
 		if (set_status_on_failure)
 			pingu_host_set_status(host, PINGU_HOST_STATUS_OFFLINE);
@@ -118,18 +131,18 @@ int pingu_ping_send(struct ev_loop *loop, struct pingu_host *host,
 	return ping == NULL ? -1 : 0;
 }
 
-void pingu_ping_read_reply(struct ev_loop *loop, struct pingu_iface *iface)
+void pingu_ping_read_reply(struct ev_loop *loop, struct pingu_iface *iface, int family)
 {
-	union sockaddr_any from;
+	union sockaddr_any from = { 0 };
 	unsigned char buf[1500];
-	struct iphdr *ip = (struct iphdr *) buf;
+	struct icmp_reply reply;
 	struct pingu_ping *ping;
 
-	int len = icmp_read_reply(iface->fd, &from.sa, sizeof(from), buf,
-				  sizeof(buf));
-	if (len <= 0)
+	int len = icmp_read_reply(pingu_iface_family(iface, family)->fd,
+				  &from.sa, sizeof(from), buf, sizeof(buf), NULL);
+	if (len <= 0 || icmp_parse_reply(buf, len, -1, &from.sa, NULL, &reply))
 		return;
-	ping = pingu_ping_find((struct icmphdr *) &buf[ip->ihl * 4], &from,
+	ping = pingu_ping_find(&reply, &from,
 				  &iface->ping_list);
 	if (ping == NULL)
 		return;

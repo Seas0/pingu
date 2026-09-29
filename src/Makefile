@@ -66,7 +66,8 @@ pinguctl_LIBS =
 mtu_OBJS = \
 	mtu.o \
 	netlink.o \
-	icmp.o
+	icmp.o \
+	sockaddr_util.o
 
 lua-client.o_CFLAGS = $(LUA_CFLAGS)
 client.so_OBJS = \
@@ -75,11 +76,14 @@ client.so_OBJS = \
 client.so_LDFLAGS = -shared
 
 ALL_OBJS= $(pingu_OBJS) $(pinguctl_OBJS) $(mtu_OBJS) $(client.so_OBJS)
+DEPS = $(sort $(ALL_OBJS:.o=.d))
 
 all: $(TARGETS) $(SUBDIRS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) $($@_CFLAGS) -c $<
+	$(CC) $(CFLAGS) $($@_CFLAGS) -MMD -MP -c $<
+
+-include $(DEPS)
 
 $(TARGETS):
 	$(CC) $(LDFLAGS) $($@_LDFLAGS) $($@_OBJS) $($@_LIBS) -o $@
@@ -88,6 +92,20 @@ pingu: $(pingu_OBJS)
 pinguctl: $(pinguctl_OBJS)
 client.so: $(client.so_OBJS)
 mtu: $(mtu_OBJS)
+
+TEST_OBJS = $(filter-out pingu.o pingu_adm.o,$(pingu_OBJS))
+
+../tests/test_ipv6: ../tests/test_ipv6.c $(TEST_OBJS) $(wildcard *.h)
+	$(CC) $(CFLAGS) -UNDEBUG -I. $(LDFLAGS) $< $(TEST_OBJS) $(pingu_LIBS) \
+		-Wl,--wrap=sendto,--wrap=sendmsg,--wrap=getpid -o $@
+
+../tests/test_mtu: ../tests/test_mtu.c mtu.c icmp.o sockaddr_util.o netlink.o $(wildcard *.h)
+	$(CC) $(CFLAGS) -UNDEBUG -I. $(LDFLAGS) $< icmp.o sockaddr_util.o netlink.o \
+		-Wl,--wrap=icmp_send_ping,--wrap=icmp_read_reply -o $@
+
+check: ../tests/test_ipv6 ../tests/test_mtu
+	../tests/test_ipv6
+	../tests/test_mtu
 
 $(SUBDIRS):
 	$(MAKE) -C $@
@@ -108,9 +126,9 @@ install-lua: client.so pingu.lua
 	$(INSTALL) client.so $(DESTDIR)$(lualibdir)/pingu/
 
 clean:
-	rm -f $(TARGETS) $(ALL_OBJS)
+	rm -f $(TARGETS) $(ALL_OBJS) $(DEPS) ../tests/test_ipv6 ../tests/test_mtu
 	for dir in $(SUBDIRS); do \
 		$(MAKE) -C $$dir $@ || break; \
 	done
 
-.PHONY: $(SUBDIRS)
+.PHONY: $(SUBDIRS) all clean check

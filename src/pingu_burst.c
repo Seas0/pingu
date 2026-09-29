@@ -19,27 +19,37 @@ void ping_burst_start(struct ev_loop *loop, struct pingu_host *host)
 	int r;
 	char buf[64];
 
-	/* we bind to device every burst in case an iface disappears and
-	   comes back. e.g ppp0 */
-	if (pingu_iface_bind_socket(host->iface, host->status) < 0) {
-		pingu_host_set_status(host, PINGU_HOST_STATUS_OFFLINE);
-		return;
-	}
-
 	host->burst.active = 1;
 	host->burst.pings_sent = 0;
 	host->burst.pings_replied = 0;
 
 	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET;
+	hints.ai_family = host->family;
+	hints.ai_socktype = SOCK_RAW;
 	r = getaddrinfo(host->host, NULL, &hints, &ai);
-	if (r < 0) {
+	if (r != 0) {
 		log_error("getaddrinfo(%s): %s", host->host, gai_strerror(r));
+		pingu_host_set_status(host, PINGU_HOST_STATUS_OFFLINE);
 		return;
 	}
 
 	for (rp = ai; rp != NULL; rp = rp->ai_next) {
-		sockaddr_from_addrinfo(&host->burst.saddr, ai);
+		if (!sockaddr_from_addrinfo(&host->burst.saddr, rp))
+			continue;
+		if (rp->ai_family == AF_INET6 &&
+		    IN6_IS_ADDR_LINKLOCAL(&host->burst.saddr.sin6.sin6_addr)) {
+			unsigned int scope = host->burst.saddr.sin6.sin6_scope_id;
+			if (host->iface->name[0]) {
+				if (scope && scope != (unsigned int)host->iface->index)
+					continue;
+				host->burst.saddr.sin6.sin6_scope_id = host->iface->index;
+			}
+			if (!host->burst.saddr.sin6.sin6_scope_id)
+				continue;
+		}
+		/* Rebind each burst in case the device was recreated (e.g. PPP). */
+		if (pingu_iface_bind_socket(host->iface, rp->ai_family, host->status) < 0)
+			continue;
 		r = pingu_ping_send(loop, host, PINGU_PING_IGNORE_ERROR);
 		if (r == 0)
 			break;
@@ -48,7 +58,7 @@ void ping_burst_start(struct ev_loop *loop, struct pingu_host *host)
 	sockaddr_to_string(&host->burst.saddr, buf, sizeof(buf));
 	if (rp == NULL) {
 		log_debug("%s: failed to send first ping to %s", host->label, buf);
-		host->burst.active = 0;
+		pingu_host_set_status(host, PINGU_HOST_STATUS_OFFLINE);
 	}
 	freeaddrinfo(ai);
 }

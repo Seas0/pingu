@@ -18,6 +18,7 @@ struct pingu_host {
 	const char *up_action;
 	const char *down_action;
 	int status;
+	int family;
 	int max_retries;
 	int required_replies;
 	ev_tstamp timeout;

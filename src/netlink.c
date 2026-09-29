@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <string.h>
 
+#include <net/if.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -69,6 +71,11 @@ static int netlink_add_rtaddr_l(struct nlmsghdr *n, int maxlen, int type,
 		return netlink_add_rtattr_l(n, maxlen, type, &sin->sin_addr,
 					    sizeof(sin->sin_addr));
 		}
+	case AF_INET6: {
+		const struct sockaddr_in6 *sin6 = (const void *)addr;
+		return netlink_add_rtattr_l(n, maxlen, type, &sin6->sin6_addr,
+					  sizeof(sin6->sin6_addr));
+		}
 	default:
 		return FALSE;
 	}
@@ -129,7 +136,7 @@ static int netlink_receive(struct netlink_fd *fd, struct nlmsghdr *reply)
 		struct nlmsghdr *h;
 
 		iov.iov_len = sizeof(buf);
-		status = recvmsg(fd->fd, &msg, MSG_DONTWAIT);
+		status = recvmsg(fd->fd, &msg, 0);
 		if (status < 0) {
 			if (errno == EINTR)
 				continue;
@@ -222,72 +229,68 @@ out:
 	return ret;
 }
 
-int netlink_route_get(struct sockaddr *dst, u_int16_t *mtu, char *ifname)
+int netlink_route_get(struct sockaddr *dst, uint32_t *mtu, char *ifname)
 {
 	struct {
-		struct nlmsghdr 	n;
+		struct nlmsghdr n;
 		union {
-			struct rtmsg		r;
-			struct ifinfomsg	i;
+			struct rtmsg r;
+			struct ifinfomsg i;
 		};
-		char   			buf[1024];
+		char buf[4096];
 	} req;
-	struct rtmsg *r = NLMSG_DATA(&req.n);
-	struct rtattr *rta[RTA_MAX+1];
-	struct rtattr *rtax[RTAX_MAX+1];
-	struct rtattr *ifla[IFLA_MAX+1];
+	struct rtattr *rta[RTA_MAX+1], *rtax[RTAX_MAX+1], *ifla[IFLA_MAX+1];
 	int index;
+	uint32_t path_mtu = 0;
 
+	if (dst->sa_family != AF_INET && dst->sa_family != AF_INET6)
+		return FALSE;
 	memset(&req, 0, sizeof(req));
 	req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
 	req.n.nlmsg_flags = NLM_F_REQUEST;
 	req.n.nlmsg_type = RTM_GETROUTE;
 	req.r.rtm_family = dst->sa_family;
-
+	req.r.rtm_dst_len = dst->sa_family == AF_INET6 ? 128 : 32;
 	netlink_add_rtaddr_l(&req.n, sizeof(req), RTA_DST, dst);
-	req.r.rtm_dst_len = 32;
-
-	if (!netlink_talk(&req.n, sizeof(req), &req.n))
-		return FALSE;
-
-	netlink_parse_rtattr(rta, RTA_MAX, RTM_RTA(r),
-			     RTM_PAYLOAD(&req.n));
-
-	if (mtu != NULL) {
-		if (rta[RTA_METRICS] == NULL)
-			return FALSE;
-
-		netlink_parse_rtattr(rtax, RTAX_MAX,
-				     RTA_DATA(rta[RTA_METRICS]),
-				     RTA_PAYLOAD(rta[RTA_METRICS]));
-		if (rtax[RTAX_MTU] == NULL)
-			return FALSE;
-
-		*mtu = *(int*) RTA_DATA(rtax[RTAX_MTU]);
+	if (dst->sa_family == AF_INET6) {
+		uint32_t scope = ((struct sockaddr_in6 *)dst)->sin6_scope_id;
+		if (scope)
+			netlink_add_rtattr_l(&req.n, sizeof(req), RTA_OIF, &scope, sizeof(scope));
 	}
-
-	if (ifname != NULL) {
-		if (rta[RTA_OIF] == NULL)
-			return FALSE;
-
-		index = *(int*) RTA_DATA(rta[RTA_OIF]);
-
+	if (!netlink_talk(&req.n, sizeof(req), &req.n) || req.n.nlmsg_type != RTM_NEWROUTE)
+		return FALSE;
+	netlink_parse_rtattr(rta, RTA_MAX, RTM_RTA(&req.r), RTM_PAYLOAD(&req.n));
+	if (mtu && rta[RTA_METRICS]) {
+		netlink_parse_rtattr(rtax, RTAX_MAX, RTA_DATA(rta[RTA_METRICS]),
+				     RTA_PAYLOAD(rta[RTA_METRICS]));
+		if (rtax[RTAX_MTU] && RTA_PAYLOAD(rtax[RTAX_MTU]) >= sizeof(path_mtu))
+			memcpy(&path_mtu, RTA_DATA(rtax[RTAX_MTU]), sizeof(path_mtu));
+	}
+	if (!rta[RTA_OIF] || RTA_PAYLOAD(rta[RTA_OIF]) < sizeof(index))
+		return FALSE;
+	memcpy(&index, RTA_DATA(rta[RTA_OIF]), sizeof(index));
+	if (ifname || (mtu && !path_mtu)) {
 		memset(&req, 0, sizeof(req));
 		req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
 		req.n.nlmsg_flags = NLM_F_REQUEST;
 		req.n.nlmsg_type = RTM_GETLINK;
 		req.i.ifi_index = index;
-		if (!netlink_talk(&req.n, sizeof(req), &req.n))
+		if (!netlink_talk(&req.n, sizeof(req), &req.n) || req.n.nlmsg_type != RTM_NEWLINK)
 			return FALSE;
-
-		netlink_parse_rtattr(ifla, IFLA_MAX, IFLA_RTA(r),
-				     IFLA_PAYLOAD(&req.n));
-		if (ifla[IFLA_IFNAME] == NULL)
-			return FALSE;
-
-		memcpy(ifname, RTA_DATA(ifla[IFLA_IFNAME]),
-		       RTA_PAYLOAD(ifla[IFLA_IFNAME]));
+		netlink_parse_rtattr(ifla, IFLA_MAX, IFLA_RTA(&req.i), IFLA_PAYLOAD(&req.n));
+		if (ifname) {
+			if (!ifla[IFLA_IFNAME])
+				return FALSE;
+			snprintf(ifname, IF_NAMESIZE, "%.*s", (int)RTA_PAYLOAD(ifla[IFLA_IFNAME]),
+				 (char *)RTA_DATA(ifla[IFLA_IFNAME]));
+		}
+		if (mtu && !path_mtu) {
+			if (!ifla[IFLA_MTU] || RTA_PAYLOAD(ifla[IFLA_MTU]) < sizeof(path_mtu))
+				return FALSE;
+			memcpy(&path_mtu, RTA_DATA(ifla[IFLA_MTU]), sizeof(path_mtu));
+		}
 	}
-
+	if (mtu)
+		*mtu = path_mtu;
 	return TRUE;
 }
